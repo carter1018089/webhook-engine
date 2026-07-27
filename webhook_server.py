@@ -4,8 +4,10 @@ import urllib.parse
 import time
 import logging
 import requests
+import os
 from openai import OpenAI
-from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
+from pydantic import BaseModel
 import uvicorn
 
 logging.basicConfig(level=logging.INFO)
@@ -13,10 +15,13 @@ logging.basicConfig(level=logging.INFO)
 app = FastAPI(title="Axiom Real-Time AI & Chart PnL Engine")
 
 # ==========================================
-# HARDCODED INTEGRATIONS
+# HARDCODED DISCORD WEBHOOKS & KEYS
 # ==========================================
-DISCORD_WEBHOOK_URL = "https://discordapp.com/api/webhooks/1531132856003330230/I9_fR0OV1k9H3yB4hg8maNDvp0yhs0-lEbrCNJjJlBgx_nCWXllEXKKci_F3Y3RQD_Wx"
-GEMINI_API_KEY = "AQ.Ab8RN6JXxf4suKDOHpPF2W7AnKPBeD8m2oS-Jwuq5ICCKhE4cw"
+WEBHOOK_LIVE_TRADES = "https://discordapp.com/api/webhooks/1531447011453174021/DW0zfF-zEdFD3Pvjy09ZjN9DN8zoNThUyZdYoS0FBpGMfNTIzJgLB1T_AO5t_luffccc"
+WEBHOOK_CA_ANALYST  = "https://discordapp.com/api/webhooks/1531447279255552191/SmK7IEX3q-YRnCx7yFH5tQnXqyyjTxXjHrnwDefQLbgn9vpQqyR_CvgAPh7MAuKkQ1Cr"
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AQ.Ab8RN6JXxf4suKDOHpPF2W7AnKPBeD8m2oS-Jwuq5ICCKhE4cw")
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
 
 # ==========================================
 # MULTI-PROVIDER AI ROTATOR
@@ -25,36 +30,32 @@ class AIRotatorEngine:
     def __init__(self, additional_keys: dict = None):
         self.providers = []
 
-        # TIER 1: Google Gemini (Hardcoded Primary)
-        self.providers.append({
-            "name": "Google Gemini",
-            "client": OpenAI(
-                api_key=GEMINI_API_KEY,
-                base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
-            ),
-            "model": "gemini-2.5-flash"
-        })
+        # TIER 1: Google Gemini (Primary)
+        if GEMINI_API_KEY:
+            self.providers.append({
+                "name": "Google Gemini",
+                "client": OpenAI(
+                    api_key=GEMINI_API_KEY,
+                    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+                ),
+                "model": "gemini-2.5-flash"
+            })
 
-        # TIER 2 & 3: Fallback providers if provided
-        if additional_keys:
-            if "groq" in additional_keys:
-                for k in additional_keys["groq"]:
-                    self.providers.append({
-                        "name": "Groq LPU",
-                        "client": OpenAI(api_key=k, base_url="https://api.groq.com/openai/v1"),
-                        "model": "llama-3.3-70b-versatile"
-                    })
-            if "openrouter" in additional_keys:
-                for k in additional_keys["openrouter"]:
-                    self.providers.append({
-                        "name": "OpenRouter Free",
-                        "client": OpenAI(api_key=k, base_url="https://openrouter.ai/api/v1"),
-                        "model": "openrouter/free"
-                    })
+        # TIER 2: Groq LPU Failover
+        if GROQ_API_KEY or (additional_keys and "groq" in additional_keys):
+            groq_key = GROQ_API_KEY or additional_keys["groq"][0]
+            self.providers.append({
+                "name": "Groq LPU",
+                "client": OpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1"),
+                "model": "llama-3.3-70b-versatile"
+            })
 
         self.current_index = 0
 
     def generate_completion(self, system_prompt: str, user_prompt: str, temperature: float = 0.2) -> str:
+        if not self.providers:
+            return "AI analysis skipped (No API keys configured)."
+
         attempts = 0
         max_attempts = len(self.providers)
 
@@ -117,7 +118,7 @@ init_db()
 # QUICKCHART & DEXSCREENER HELPERS
 # ==========================================
 def generate_trade_chart_url(symbol: str, entry_price_sol: float, exit_price_sol: float) -> str:
-    """Generates an instant visual bar chart URL using QuickChart REST API."""
+    """Generates a visual bar chart URL using QuickChart REST API."""
     pnl_color = "#10B981" if exit_price_sol >= entry_price_sol else "#EF4444"
     
     chart_config = {
@@ -183,14 +184,14 @@ def get_dexscreener_info(token_ca: str):
 # DISCORD RICH EMBED SENDER
 # ==========================================
 def send_discord_rich_embed(symbol: str, action: str, token_amount: float, sol_amount: float, 
-                           realized_pnl: float, roi_percent: float, entry_price: float, 
-                           exit_price: float, ai_insight: str, mint: str, tx_sig: str):
+                            realized_pnl: float, roi_percent: float, entry_price: float, 
+                            exit_price: float, ai_insight: str, mint: str, tx_sig: str):
     
-    chart_url = generate_trade_chart_url(symbol, entry_price, exit_price) if exit_price > 0 else None
+    chart_url = generate_trade_chart_url(symbol, entry_price, exit_price) if (action == "SELL" and exit_price > 0) else None
     dex_url = f"https://dexscreener.com/solana/{mint}" if mint else "https://dexscreener.com"
     solscan_url = f"https://solscan.io/tx/{tx_sig}"
 
-    embed_color = 65280 if realized_pnl >= 0 else 16711680 # Green vs Red
+    embed_color = 65280 if realized_pnl >= 0 else 16711680 # Green for Profit/Buy, Red for Loss
 
     fields = [
         {"name": "Action", "value": f"`{action}`", "inline": True},
@@ -202,7 +203,10 @@ def send_discord_rich_embed(symbol: str, action: str, token_amount: float, sol_a
         fields.append({"name": "Realized PnL", "value": f"**{realized_pnl:+.3f} SOL** ({roi_percent:+.2f}%)", "inline": True})
         fields.append({"name": "Entry ➔ Exit", "value": f"`{entry_price:.8f}` ➔ `{exit_price:.8f}` SOL", "inline": True})
 
-    fields.append({"name": "🧠 AI Post-Mortem", "value": f"> {ai_insight}", "inline": False})
+    if ai_insight:
+        title_tag = "🧠 Post-Mortem Analysis" if realized_pnl < 0 else "📈 Win Breakdown"
+        fields.append({"name": title_tag, "value": f"> {ai_insight}", "inline": False})
+
     fields.append({"name": "Links", "value": f"[DexScreener]({dex_url}) | [Solscan]({solscan_url})", "inline": False})
 
     embed_payload = {
@@ -219,9 +223,9 @@ def send_discord_rich_embed(symbol: str, action: str, token_amount: float, sol_a
         embed_payload["embeds"][0]["image"] = {"url": chart_url}
 
     try:
-        requests.post(DISCORD_WEBHOOK_URL, json=embed_payload, timeout=5)
+        requests.post(WEBHOOK_LIVE_TRADES, json=embed_payload, timeout=5)
     except Exception as e:
-        logging.error(f"Failed to post to Discord: {e}")
+        logging.error(f"Failed to post to Discord Live Trades Channel: {e}")
 
 # ==========================================
 # TRADE PROCESSING ENGINE
@@ -275,12 +279,21 @@ def process_and_log_trade(tx_type: str, mint: str, symbol: str, token_amount: fl
     conn.commit()
     conn.close()
 
-    # Generate AI Post-Mortem
-    sys_prompt = "You are a sharp crypto trading analyst. Provide a 2-sentence breakdown of the execution and momentum."
-    usr_prompt = f"Action: {tx_type} | Symbol: ${symbol} | Size: {sol_amount:.3f} SOL | Realized PnL: {realized_pnl:+.3f} SOL ({roi_percent:+.2f}%)"
-    ai_insight = ai_engine.generate_completion(sys_prompt, usr_prompt)
+    # Conditional AI Generation
+    ai_insight = None
+    if tx_type == "SELL":
+        if realized_pnl < 0:
+            # POST-MORTEM LOSS BREAKDOWN
+            sys_prompt = "You are an expert crypto trading analyst. Provide a sharp, 2-sentence post-mortem explaining execution errors, slippage, or risk control lessons."
+            usr_prompt = f"Action: SELL (LOSS) | Symbol: ${symbol} | Size: {sol_amount:.3f} SOL | Loss: {realized_pnl:.3f} SOL ({roi_percent:.2f}%)"
+            ai_insight = ai_engine.generate_completion(sys_prompt, usr_prompt)
+        else:
+            # PROFIT WIN BREAKDOWN
+            sys_prompt = "You are an expert crypto trading analyst. Provide a sharp, 2-sentence breakdown explaining why this trade made money (momentum, entry timing, liquidity)."
+            usr_prompt = f"Action: SELL (PROFIT) | Symbol: ${symbol} | Size: {sol_amount:.3f} SOL | Profit: +{realized_pnl:.3f} SOL (+{roi_percent:.2f}%)"
+            ai_insight = ai_engine.generate_completion(sys_prompt, usr_prompt)
 
-    # Dispatch Rich Embed
+    # Dispatch Rich Embed to #live-trades
     send_discord_rich_embed(symbol, tx_type, token_amount, sol_amount, realized_pnl, roi_percent, entry_price, exit_price, ai_insight, mint, tx_sig)
 
 def parse_helius_payload(payload: list):
@@ -316,6 +329,42 @@ async def receive_helius_event(request: Request, background_tasks: BackgroundTas
     if isinstance(payload, list):
         background_tasks.add_task(parse_helius_payload, payload)
     return {"status": "ok"}
+
+# ==========================================
+# CHANNEL 2: ON-DEMAND CA ANALYST ROUTE
+# ==========================================
+class CARequest(BaseModel):
+    contract_address: str
+    symbol: str = "UNKNOWN"
+
+@app.post("/analyze-ca")
+def analyze_ca(data: CARequest):
+    ca = data.contract_address.strip()
+    price_sol, dex_symbol = get_dexscreener_info(ca)
+    symbol = dex_symbol if dex_symbol != "TOKEN" else data.symbol.upper()
+
+    embed = {
+        "embeds": [{
+            "title": f"📊 Token Analysis: ${symbol}",
+            "color": 3447003,
+            "fields": [
+                {"name": "Contract Address (CA)", "value": f"`{ca}`", "inline": False},
+                {"name": "DexScreener", "value": f"[View Chart](https://dexscreener.com/solana/{ca})", "inline": True},
+                {"name": "Solscan", "value": f"[View Explorer](https://solscan.io/token/{ca})", "inline": True},
+                {"name": "RugCheck", "value": f"[Check Safety](https://rugcheck.xyz/tokens/{ca})", "inline": True}
+            ],
+            "footer": {"text": "Axiom CA Analyst Engine"}
+        }]
+    }
+
+    try:
+        res = requests.post(WEBHOOK_CA_ANALYST, json=embed, timeout=5)
+        if res.status_code in [200, 204]:
+            return {"status": "posted_to_ca_channel"}
+        else:
+            raise HTTPException(status_code=500, detail=f"Discord Webhook Error: {res.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     print("🚀 Axiom AI, PnL & Chart Webhook Engine running on port 8000...")
