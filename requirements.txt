@@ -1,3 +1,11 @@
 streamlit
 groq
 requests
+discord.py
+requests
+google-generativeai
+python-dotenv
+openai
+fastapi
+uvicorn
+requests
