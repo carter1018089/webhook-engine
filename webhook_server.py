@@ -286,17 +286,14 @@ def process_and_log_trade(tx_type: str, mint: str, symbol: str, token_amount: fl
     ai_insight = None
     if tx_type == "SELL":
         if realized_pnl < 0:
-            # POST-MORTEM LOSS BREAKDOWN
             sys_prompt = "You are an expert crypto trading analyst. Provide a sharp, 2-sentence post-mortem explaining execution errors, slippage, or risk control lessons."
             usr_prompt = f"Action: SELL (LOSS) | Symbol: ${symbol} | Size: {sol_amount:.3f} SOL | Loss: {realized_pnl:.3f} SOL ({roi_percent:.2f}%)"
             ai_insight = ai_engine.generate_completion(sys_prompt, usr_prompt)
         else:
-            # PROFIT WIN BREAKDOWN
             sys_prompt = "You are an expert crypto trading analyst. Provide a sharp, 2-sentence breakdown explaining why this trade made money (momentum, entry timing, liquidity)."
             usr_prompt = f"Action: SELL (PROFIT) | Symbol: ${symbol} | Size: {sol_amount:.3f} SOL | Profit: +{realized_pnl:.3f} SOL (+{roi_percent:.2f}%)"
             ai_insight = ai_engine.generate_completion(sys_prompt, usr_prompt)
 
-    # Dispatch Rich Embed to #live-trades
     send_discord_rich_embed(symbol, tx_type, token_amount, sol_amount, realized_pnl, roi_percent, entry_price, exit_price, ai_insight, mint, tx_sig)
 
 def parse_helius_payload(payload: list):
@@ -334,7 +331,7 @@ async def receive_helius_event(request: Request, background_tasks: BackgroundTas
     return {"status": "ok"}
 
 # ==========================================
-# CHANNEL 2: ON-DEMAND CA ANALYST ROUTE
+# CHANNEL 2: CA ANALYST WITH BUY/SELL & BULL/BEAR NOTIFIER
 # ==========================================
 class CARequest(BaseModel):
     contract_address: str
@@ -346,7 +343,6 @@ def analyze_ca(data: CARequest):
     if not ca or len(ca) < 30:
         raise HTTPException(status_code=400, detail="Invalid Contract Address.")
 
-    # Fetch market data directly from DexScreener
     dex_url = f"https://api.dexscreener.com/latest/dex/tokens/{ca}"
     try:
         dex_res = requests.get(dex_url, timeout=10)
@@ -363,7 +359,7 @@ def analyze_ca(data: CARequest):
         market_cap = pair.get("fdv", pair.get("marketCap", "N/A"))
         liquidity_usd = pair.get("liquidity", {}).get("usd", "N/A")
         
-        # 24h & 5m Buy/Sell Notifiers
+        # Extract Buy/Sell Transaction Notifiers
         txns_24h = pair.get("txns", {}).get("h24", {})
         buys_24h = txns_24h.get("buys", 0)
         sells_24h = txns_24h.get("sells", 0)
@@ -373,15 +369,40 @@ def analyze_ca(data: CARequest):
         sells_5m = txns_5m.get("sells", 0)
 
         vol_24h = pair.get("volume", {}).get("h24", 0)
+        price_change_24h = pair.get("priceChange", {}).get("h24", 0.0)
         
-        # Buy vs Sell Sentiment Calculation
+        # Calculate Bullish vs Bearish Overall Indicator
         total_txns_24h = buys_24h + sells_24h
         if total_txns_24h > 0:
             buy_pct = (buys_24h / total_txns_24h) * 100
-            sentiment = "🟢 BULLISH OVERALL" if buy_pct >= 55 else ("🔴 BEARISH OVERALL" if buy_pct <= 45 else "🟡 NEUTRAL / BALANCED")
-        else:
-            sentiment = "⚪ NO RECENT DATA"
             
+            if buy_pct >= 60 and price_change_24h > 0:
+                overall_sentiment = f"🟢 **STRONGLY BULLISH** ({buy_pct:.1f}% Buys)"
+                embed_color = 65280 # Green
+            elif buy_pct >= 52:
+                overall_sentiment = f"🟢 **BULLISH** ({buy_pct:.1f}% Buys)"
+                embed_color = 65280 # Green
+            elif buy_pct <= 40 and price_change_24h < 0:
+                overall_sentiment = f"🔴 **STRONGLY BEARISH** ({buy_pct:.1f}% Buys)"
+                embed_color = 16711680 # Red
+            elif buy_pct <= 48:
+                overall_sentiment = f"🔴 **BEARISH** ({buy_pct:.1f}% Buys)"
+                embed_color = 16711680 # Red
+            else:
+                overall_sentiment = f"🟡 **NEUTRAL / CONSOLIDATING** ({buy_pct:.1f}% Buys)"
+                embed_color = 16776960 # Yellow
+        else:
+            overall_sentiment = "⚪ **NO RECENT TRADES**"
+            embed_color = 8421504
+
+        # Buy / Sell Activity Gauge
+        if buys_5m > sells_5m:
+            momentum_5m = "🔥 **BUY PRESSURE (5m)**"
+        elif sells_5m > buys_5m:
+            momentum_5m = "⚠️ **SELL PRESSURE (5m)**"
+        else:
+            momentum_5m = "⚖️ **EQUAL ACTIVITY (5m)**"
+
         mcap_formatted = f"${market_cap:,.0f}" if isinstance(market_cap, (int, float)) else f"${market_cap}"
         liq_formatted = f"${liquidity_usd:,.0f}" if isinstance(liquidity_usd, (int, float)) else f"${liquidity_usd}"
         vol_formatted = f"${vol_24h:,.0f}" if isinstance(vol_24h, (int, float)) else f"${vol_24h}"
@@ -393,28 +414,30 @@ def analyze_ca(data: CARequest):
         liq_formatted = "N/A"
         vol_formatted = "N/A"
         buys_24h, sells_24h, buys_5m, sells_5m = 0, 0, 0, 0
-        sentiment = "⚠️ No DexScreener Pair Found"
+        overall_sentiment = "⚠️ **NO DEX DATA FOUND**"
+        momentum_5m = "N/A"
+        price_change_24h = 0.0
+        embed_color = 3447003
 
     embed = {
         "embeds": [{
-            "title": f"📊 Token Analysis: {token_name} (${token_symbol})",
-            "color": 3447003, # Blue
+            "title": f"📊 CA Analyst Report: {token_name} (${token_symbol})",
+            "color": embed_color,
             "fields": [
                 {"name": "Contract Address", "value": f"`{ca}`", "inline": False},
-                {"name": "Price (USD)", "value": f"`${price_usd}`", "inline": True},
+                {"name": "Price", "value": f"`${price_usd}` ({price_change_24h:+.2f}% 24h)", "inline": True},
                 {"name": "Market Cap", "value": f"`{mcap_formatted}`", "inline": True},
                 {"name": "Liquidity", "value": f"`{liq_formatted}`", "inline": True},
-                {"name": "📊 Market Momentum", "value": f"**{sentiment}**", "inline": False},
-                {"name": "🔥 5m Buys vs Sells", "value": f"🟢 **{buys_5m}** Buys | 🔴 **{sells_5m}** Sells", "inline": True},
-                {"name": "⚡ 24h Buys vs Sells", "value": f"🟢 **{buys_24h}** Buys | 🔴 **{sells_24h}** Sells", "inline": True},
-                {"name": "24h Total Volume", "value": f"`{vol_formatted}`", "inline": True},
+                {"name": "🚨 Overall Market Sentiment", "value": overall_sentiment, "inline": False},
+                {"name": "⚡ 5m Buy/Sell Notifier", "value": f"🟢 **{buys_5m}** Buys | 🔴 **{sells_5m}** Sells\nStatus: {momentum_5m}", "inline": True},
+                {"name": "📊 24h Buy/Sell Notifier", "value": f"🟢 **{buys_24h}** Buys | 🔴 **{sells_24h}** Sells\nVolume: `{vol_formatted}`", "inline": True},
                 {
                     "name": "🔗 Quick Links", 
                     "value": f"[DexScreener](https://dexscreener.com/solana/{ca}) | [Solscan](https://solscan.io/token/{ca}) | [RugCheck](https://rugcheck.xyz/tokens/{ca})", 
                     "inline": False
                 }
             ],
-            "footer": {"text": "Axiom CA Analyst Engine • Buy/Sell Notifier Active"}
+            "footer": {"text": "Axiom CA Analyst • Buy/Sell & Sentiment Notifiers Active"}
         }]
     }
 
@@ -439,7 +462,6 @@ def add_wallet_to_helius(data: AddWalletRequest):
     if not wallet or len(wallet) < 32:
         raise HTTPException(status_code=400, detail="Invalid Solana wallet address.")
 
-    # Fetch current webhook configuration from Helius
     get_url = f"https://api.helius.xyz/v0/webhooks/{HELIUS_WEBHOOK_ID}?api-key={HELIUS_API_KEY}"
     res = requests.get(get_url)
     if res.status_code != 200:
@@ -451,7 +473,6 @@ def add_wallet_to_helius(data: AddWalletRequest):
     if wallet in current_addresses:
         return {"status": "exists", "message": f"Wallet `{wallet}` is already being tracked."}
 
-    # Append new wallet and update Helius
     current_addresses.append(wallet)
     webhook_data["accountAddresses"] = current_addresses
 
