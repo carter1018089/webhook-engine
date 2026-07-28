@@ -18,10 +18,13 @@ app = FastAPI(title="Axiom Real-Time AI & Chart PnL Engine")
 # HARDCODED DISCORD WEBHOOKS & KEYS
 # ==========================================
 WEBHOOK_LIVE_TRADES = "https://discordapp.com/api/webhooks/1531447011453174021/DW0zfF-zEdFD3Pvjy09ZjN9DN8zoNThUyZdYoS0FBpGMfNTIzJgLB1T_AO5t_luffccc"
-WEBHOOK_CA_ANALYST  = "https://discordapp.com/api/webhooks/1531447279255552191/SmK7IEX3q-YRnCx7yFH5tQnXqyyjTxXjHrnwDefQLbgn9vpQqyR_CvgAPh7MAuKkQ1Cr"
+WEBHOOK_CA_ANALYST  = "https://discordapp.com/api/webhooks/1531454599821660270/fbD15xrqZ4yKUwavSwzrRWqCXIqqI8sxLHcx-TBRL2ZkgS-n12422PnMU-XfJIIsvRkZ"
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AQ.Ab8RN6JXxf4suKDOHpPF2W7AnKPBeD8m2oS-Jwuq5ICCKhE4cw")
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
+
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "82763842-be46-4d5d-90cd-d697229f357a")
+HELIUS_WEBHOOK_ID = os.getenv("HELIUS_WEBHOOK_ID", "c93c768f-c1b7-415d-bdca-cff100e0ed47")
 
 # ==========================================
 # MULTI-PROVIDER AI ROTATOR
@@ -340,20 +343,78 @@ class CARequest(BaseModel):
 @app.post("/analyze-ca")
 def analyze_ca(data: CARequest):
     ca = data.contract_address.strip()
-    price_sol, dex_symbol = get_dexscreener_info(ca)
-    symbol = dex_symbol if dex_symbol != "TOKEN" else data.symbol.upper()
+    if not ca or len(ca) < 30:
+        raise HTTPException(status_code=400, detail="Invalid Contract Address.")
+
+    # Fetch market data directly from DexScreener
+    dex_url = f"https://api.dexscreener.com/latest/dex/tokens/{ca}"
+    try:
+        dex_res = requests.get(dex_url, timeout=10)
+        dex_data = dex_res.json()
+        pairs = dex_data.get("pairs", [])
+    except Exception:
+        pairs = []
+
+    if pairs:
+        pair = max(pairs, key=lambda x: x.get("liquidity", {}).get("usd", 0) or 0)
+        token_name = pair.get("baseToken", {}).get("name", "Solana Token")
+        token_symbol = pair.get("baseToken", {}).get("symbol", data.symbol.upper())
+        price_usd = pair.get("priceUsd", "N/A")
+        market_cap = pair.get("fdv", pair.get("marketCap", "N/A"))
+        liquidity_usd = pair.get("liquidity", {}).get("usd", "N/A")
+        
+        # 24h & 5m Buy/Sell Notifiers
+        txns_24h = pair.get("txns", {}).get("h24", {})
+        buys_24h = txns_24h.get("buys", 0)
+        sells_24h = txns_24h.get("sells", 0)
+        
+        txns_5m = pair.get("txns", {}).get("m5", {})
+        buys_5m = txns_5m.get("buys", 0)
+        sells_5m = txns_5m.get("sells", 0)
+
+        vol_24h = pair.get("volume", {}).get("h24", 0)
+        
+        # Buy vs Sell Sentiment Calculation
+        total_txns_24h = buys_24h + sells_24h
+        if total_txns_24h > 0:
+            buy_pct = (buys_24h / total_txns_24h) * 100
+            sentiment = "🟢 BULLISH OVERALL" if buy_pct >= 55 else ("🔴 BEARISH OVERALL" if buy_pct <= 45 else "🟡 NEUTRAL / BALANCED")
+        else:
+            sentiment = "⚪ NO RECENT DATA"
+            
+        mcap_formatted = f"${market_cap:,.0f}" if isinstance(market_cap, (int, float)) else f"${market_cap}"
+        liq_formatted = f"${liquidity_usd:,.0f}" if isinstance(liquidity_usd, (int, float)) else f"${liquidity_usd}"
+        vol_formatted = f"${vol_24h:,.0f}" if isinstance(vol_24h, (int, float)) else f"${vol_24h}"
+    else:
+        token_name = "Solana Token"
+        token_symbol = data.symbol.upper() if data.symbol != "UNKNOWN" else "UNKNOWN"
+        price_usd = "N/A"
+        mcap_formatted = "N/A"
+        liq_formatted = "N/A"
+        vol_formatted = "N/A"
+        buys_24h, sells_24h, buys_5m, sells_5m = 0, 0, 0, 0
+        sentiment = "⚠️ No DexScreener Pair Found"
 
     embed = {
         "embeds": [{
-            "title": f"📊 Token Analysis: ${symbol}",
-            "color": 3447003,
+            "title": f"📊 Token Analysis: {token_name} (${token_symbol})",
+            "color": 3447003, # Blue
             "fields": [
-                {"name": "Contract Address (CA)", "value": f"`{ca}`", "inline": False},
-                {"name": "DexScreener", "value": f"[View Chart](https://dexscreener.com/solana/{ca})", "inline": True},
-                {"name": "Solscan", "value": f"[View Explorer](https://solscan.io/token/{ca})", "inline": True},
-                {"name": "RugCheck", "value": f"[Check Safety](https://rugcheck.xyz/tokens/{ca})", "inline": True}
+                {"name": "Contract Address", "value": f"`{ca}`", "inline": False},
+                {"name": "Price (USD)", "value": f"`${price_usd}`", "inline": True},
+                {"name": "Market Cap", "value": f"`{mcap_formatted}`", "inline": True},
+                {"name": "Liquidity", "value": f"`{liq_formatted}`", "inline": True},
+                {"name": "📊 Market Momentum", "value": f"**{sentiment}**", "inline": False},
+                {"name": "🔥 5m Buys vs Sells", "value": f"🟢 **{buys_5m}** Buys | 🔴 **{sells_5m}** Sells", "inline": True},
+                {"name": "⚡ 24h Buys vs Sells", "value": f"🟢 **{buys_24h}** Buys | 🔴 **{sells_24h}** Sells", "inline": True},
+                {"name": "24h Total Volume", "value": f"`{vol_formatted}`", "inline": True},
+                {
+                    "name": "🔗 Quick Links", 
+                    "value": f"[DexScreener](https://dexscreener.com/solana/{ca}) | [Solscan](https://solscan.io/token/{ca}) | [RugCheck](https://rugcheck.xyz/tokens/{ca})", 
+                    "inline": False
+                }
             ],
-            "footer": {"text": "Axiom CA Analyst Engine"}
+            "footer": {"text": "Axiom CA Analyst Engine • Buy/Sell Notifier Active"}
         }]
     }
 
@@ -365,6 +426,40 @@ def analyze_ca(data: CARequest):
             raise HTTPException(status_code=500, detail=f"Discord Webhook Error: {res.status_code}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ==========================================
+# ADD WALLET TO HELIUS WEBHOOK
+# ==========================================
+class AddWalletRequest(BaseModel):
+    wallet_address: str
+
+@app.post("/add-wallet")
+def add_wallet_to_helius(data: AddWalletRequest):
+    wallet = data.wallet_address.strip()
+    if not wallet or len(wallet) < 32:
+        raise HTTPException(status_code=400, detail="Invalid Solana wallet address.")
+
+    # Fetch current webhook configuration from Helius
+    get_url = f"https://api.helius.xyz/v0/webhooks/{HELIUS_WEBHOOK_ID}?api-key={HELIUS_API_KEY}"
+    res = requests.get(get_url)
+    if res.status_code != 200:
+        raise HTTPException(status_code=500, detail="Failed to fetch current Helius webhook info.")
+
+    webhook_data = res.json()
+    current_addresses = webhook_data.get("accountAddresses", [])
+
+    if wallet in current_addresses:
+        return {"status": "exists", "message": f"Wallet `{wallet}` is already being tracked."}
+
+    # Append new wallet and update Helius
+    current_addresses.append(wallet)
+    webhook_data["accountAddresses"] = current_addresses
+
+    put_res = requests.put(get_url, json=webhook_data)
+    if put_res.status_code == 200:
+        return {"status": "success", "message": f"Successfully added `{wallet}` to Helius tracker!", "total_tracked": len(current_addresses)}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to update Helius webhook.")
 
 if __name__ == "__main__":
     print("🚀 Axiom AI, PnL & Chart Webhook Engine running on port 8000...")
