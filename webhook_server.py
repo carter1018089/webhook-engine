@@ -485,3 +485,189 @@ def add_wallet_to_helius(data: AddWalletRequest):
 if __name__ == "__main__":
     print("🚀 Axiom AI, PnL & Chart Webhook Engine running on port 8000...")
     uvicorn.run("webhook_server:app", host="0.0.0.0", port=8000, reload=True)
+# ==========================================
+# RUGCHECK & ON-CHAIN RISK HELPER
+# ==========================================
+def check_solana_rug_risk(ca: str):
+    """
+    Fetches bundling, holder concentration, and mint/freeze authority risks via RugCheck API.
+    """
+    url = f"https://api.rugcheck.xyz/v1/tokens/{ca}/report/summary"
+    try:
+        res = requests.get(url, timeout=6)
+        if res.status_code == 200:
+            data = res.json()
+            
+            # Extract risks
+            risks = data.get("risks", [])
+            risk_score = data.get("score", 0)
+            
+            # Extract Holder & Bundling metrics
+            top_holders = data.get("topHolders", [])
+            total_top_10_pct = sum([h.get("pct", 0) for h in top_holders[:10]])
+            
+            # Detect bundling / high risk flags
+            bundled_flag = False
+            mint_active = False
+            freeze_active = False
+            risk_summary_list = []
+
+            for r in risks:
+                name = r.get("name", "").lower()
+                desc = r.get("description", "")
+                if "bundle" in name or "bundle" in desc.lower():
+                    bundled_flag = True
+                    risk_summary_list.append("⚠️ **BUNDLED LAUNCH DETECTED**")
+                if "mint" in name:
+                    mint_active = True
+                    risk_summary_list.append("🔴 Mint Authority Active")
+                if "freeze" in name:
+                    freeze_active = True
+                    risk_summary_list.append("🔴 Freeze Authority Active")
+
+            # Check single max holder
+            max_single_holder = top_holders[0].get("pct", 0) if top_holders else 0
+            if max_single_holder > 15:
+                risk_summary_list.append(f"⚠️ Single Wallet Holds {max_single_holder:.1f}%")
+
+            return {
+                "score": risk_score,
+                "top_10_pct": total_top_10_pct,
+                "is_bundled": bundled_flag,
+                "mint_active": mint_active,
+                "freeze_active": freeze_active,
+                "risk_flags": risk_summary_list
+            }
+    except Exception as e:
+        logging.error(f"RugCheck API query failed: {e}")
+        
+    return {
+        "score": 0,
+        "top_10_pct": 0.0,
+        "is_bundled": False,
+        "mint_active": False,
+        "freeze_active": False,
+        "risk_flags": ["⚠️ Safety check timed out"]
+    }
+
+# ==========================================
+# UPDATED CA ANALYST ENDPOINT
+# ==========================================
+@app.post("/analyze-ca")
+def analyze_ca(data: CARequest):
+    ca = data.contract_address.strip()
+    if not ca or len(ca) < 30:
+        raise HTTPException(status_code=400, detail="Invalid Contract Address.")
+
+    # 1. Fetch DexScreener Trading Data
+    dex_url = f"https://api.dexscreener.com/latest/dex/tokens/{ca}"
+    try:
+        dex_res = requests.get(dex_url, timeout=8)
+        dex_data = dex_res.json()
+        pairs = dex_data.get("pairs", [])
+    except Exception:
+        pairs = []
+
+    # 2. Fetch On-Chain Rug & Bundling Risk Data
+    rug_info = check_solana_rug_risk(ca)
+
+    if pairs:
+        pair = max(pairs, key=lambda x: x.get("liquidity", {}).get("usd", 0) or 0)
+        token_name = pair.get("baseToken", {}).get("name", "Solana Token")
+        token_symbol = pair.get("baseToken", {}).get("symbol", data.symbol.upper())
+        price_usd = pair.get("priceUsd", "N/A")
+        market_cap = pair.get("fdv", pair.get("marketCap", "N/A"))
+        liquidity_usd = pair.get("liquidity", {}).get("usd", "N/A")
+        
+        # Transactions & Volume
+        txns_24h = pair.get("txns", {}).get("h24", {})
+        buys_24h = txns_24h.get("buys", 0)
+        sells_24h = txns_24h.get("sells", 0)
+        
+        txns_5m = pair.get("txns", {}).get("m5", {})
+        buys_5m = txns_5m.get("buys", 0)
+        sells_5m = txns_5m.get("sells", 0)
+
+        vol_24h = pair.get("volume", {}).get("h24", 0)
+        price_change_24h = pair.get("priceChange", {}).get("h24", 0.0)
+        
+        # DexScreener Boosts / Traffic Indicators
+        boosts = pair.get("boosts", {}).get("active", 0)
+        boost_status = f"🔥 `{boosts}` DexScreener Boosts Active" if boosts > 0 else "⚪ No Active Boosts"
+
+        # Calculate Sentiment & Safety Adjustments
+        total_txns_24h = buys_24h + sells_24h
+        buy_pct = (buys_24h / total_txns_24h * 100) if total_txns_24h > 0 else 0
+
+        # OVERRIDE: If coin is bundled or top 10 hold > 50%, force sentiment to DANGER
+        if rug_info["is_bundled"] or rug_info["top_10_pct"] > 50.0:
+            overall_sentiment = f"🚨 **EXTREME RUG RISK / BUNDLED**"
+            embed_color = 16711680 # Red
+        elif buy_pct >= 58 and price_change_24h > 0:
+            overall_sentiment = f"🟢 **BULLISH** ({buy_pct:.1f}% Buys)"
+            embed_color = 65280 # Green
+        elif buy_pct <= 45:
+            overall_sentiment = f"🔴 **BEARISH** ({buy_pct:.1f}% Buys)"
+            embed_color = 16711680 # Red
+        else:
+            overall_sentiment = f"🟡 **NEUTRAL / CONSOLIDATING** ({buy_pct:.1f}% Buys)"
+            embed_color = 16776960 # Yellow
+
+        mcap_formatted = f"${market_cap:,.0f}" if isinstance(market_cap, (int, float)) else f"${market_cap}"
+        liq_formatted = f"${liquidity_usd:,.0f}" if isinstance(liquidity_usd, (int, float)) else f"${liquidity_usd}"
+        vol_formatted = f"${vol_24h:,.0f}" if isinstance(vol_24h, (int, float)) else f"${vol_24h}"
+    else:
+        token_name = "Solana Token"
+        token_symbol = data.symbol.upper()
+        price_usd = "N/A"
+        mcap_formatted = "N/A"
+        liq_formatted = "N/A"
+        vol_formatted = "N/A"
+        buys_24h, sells_24h, buys_5m, sells_5m = 0, 0, 0, 0
+        overall_sentiment = "⚠️ **NO DEX DATA FOUND**"
+        boost_status = "N/A"
+        price_change_24h = 0.0
+        embed_color = 8421504
+
+    # Build Risk Warning String
+    risk_warnings = "\n".join(rug_info["risk_flags"]) if rug_info["risk_flags"] else "✅ No major mint/freeze/bundle flags"
+
+    embed = {
+        "embeds": [{
+            "title": f"🔍 CA Security & Market Report: {token_name} (${token_symbol})",
+            "color": embed_color,
+            "fields": [
+                {"name": "Contract Address", "value": f"`{ca}`", "inline": False},
+                {"name": "Price", "value": f"`${price_usd}` ({price_change_24h:+.2f}%)", "inline": True},
+                {"name": "Market Cap", "value": f"`{mcap_formatted}`", "inline": True},
+                {"name": "Liquidity", "value": f"`{liq_formatted}`", "inline": True},
+                
+                # --- NEW SAFETY & HOLDER METRICS ---
+                {"name": "👥 Top 10 Holders", "value": f"`{rug_info['top_10_pct']:.1f}%` of Total Supply", "inline": True},
+                {"name": "📦 Bundled Launch Status", "value": "🚨 **YES (BUNDLED)**" if rug_info["is_bundled"] else "✅ **Clean / Unbundled**", "inline": True},
+                {"name": "👀 DexScreener Activity", "value": boost_status, "inline": True},
+                
+                # --- RISK & SENTIMENT ---
+                {"name": "🚨 Risk Flags & Warnings", "value": risk_warnings, "inline": False},
+                {"name": "📊 Market Sentiment", "value": overall_sentiment, "inline": False},
+                {"name": "⚡ 5m Volume / Notifier", "value": f"🟢 **{buys_5m}** Buys | 🔴 **{sells_5m}** Sells", "inline": True},
+                {"name": "📊 24h Volume / Notifier", "value": f"🟢 **{buys_24h}** Buys | 🔴 **{sells_24h}** Sells\nVol: `{vol_formatted}`", "inline": True},
+                
+                {
+                    "name": "🔗 Verification Links", 
+                    "value": f"[RugCheck Report](https://rugcheck.xyz/tokens/{ca}) | [DexScreener](https://dexscreener.com/solana/{ca}) | [Photon](https://photon-sol.tinyastro.io/en/lp/{ca})", 
+                    "inline": False
+                }
+            ],
+            "footer": {"text": "Axiom CA Security Engine • RugCheck & Bundle Sniffer Active"}
+        }]
+    }
+
+    try:
+        res = requests.post(WEBHOOK_CA_ANALYST, json=embed, timeout=5)
+        if res.status_code in [200, 204]:
+            return {"status": "posted_to_ca_channel"}
+        else:
+            raise HTTPException(status_code=500, detail=f"Discord Webhook Error: {res.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
